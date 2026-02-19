@@ -190,8 +190,10 @@ def find_summary_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     return None
 
 
-async def create_thread(ctx: commands.Context, name: str) -> discord.Thread:
-    """Create a thread on the user's command message."""
+async def get_or_create_thread(ctx: commands.Context, name: str) -> discord.abc.Messageable:
+    """If already in a thread, return it. Otherwise create a new thread on the message."""
+    if isinstance(ctx.channel, discord.Thread):
+        return ctx.channel
     return await ctx.message.create_thread(name=name[:100])
 
 
@@ -333,7 +335,7 @@ async def on_ready():
 @bot.command(name="today")
 async def cmd_today(ctx: commands.Context):
     """!today — Generate a summary for today immediately."""
-    thread = await create_thread(ctx, f"Today's Summary")
+    thread = await get_or_create_thread(ctx, "Today's Summary")
     await thread.send("⏳ Generating summary... this may take a minute.")
     try:
         summary = await run_summary(ctx.guild)
@@ -349,7 +351,7 @@ async def cmd_today(ctx: commands.Context):
 @bot.command(name="yesterday")
 async def cmd_yesterday(ctx: commands.Context):
     """!yesterday — Generate a summary for yesterday."""
-    thread = await create_thread(ctx, f"Yesterday's Summary")
+    thread = await get_or_create_thread(ctx, "Yesterday's Summary")
     await thread.send("⏳ Generating yesterday's summary...")
     try:
         yesterday = datetime.now(timezone.utc) - timedelta(days=1)
@@ -370,7 +372,7 @@ async def cmd_query(ctx: commands.Context, *, question: str = ""):
         await ctx.reply("Usage: `!query <your question>`")
         return
 
-    thread = await create_thread(ctx, question[:100])
+    thread = await get_or_create_thread(ctx, question[:100])
     await thread.send("🤔 Looking through project history...")
     try:
         context = await fetch_project_context(ctx.guild)
@@ -406,7 +408,7 @@ Answer concisely."""
 @bot.command(name="summary")
 async def cmd_summary(ctx: commands.Context):
     """!summary — Generate a high-level overview of the entire project."""
-    thread = await create_thread(ctx, "Project Overview")
+    thread = await get_or_create_thread(ctx, "Project Overview")
     await thread.send("📊 Generating project overview...")
     try:
         context = await fetch_project_context(ctx.guild)
@@ -446,7 +448,6 @@ Write the project overview now."""
 @bot.command(name="help")
 async def cmd_help(ctx: commands.Context):
     """!help — Show available commands."""
-    thread = await create_thread(ctx, "Bot Help")
     help_text = """**📋 Summary Bot Commands**
 
 `!today` — Generate today's summary
@@ -461,7 +462,7 @@ The bot also posts an automatic summary every day at {hour:02d}:{minute:02d} UTC
         minute=SUMMARY_MINUTE,
         channel=SUMMARY_CHANNEL_NAME,
     )
-    await thread.send(help_text)
+    await ctx.send(help_text)
 
 
 # ---------------------------------------------------------------------------
