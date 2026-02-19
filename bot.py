@@ -56,7 +56,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!summary", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ---------------------------------------------------------------------------
@@ -147,18 +147,15 @@ async def collect_all_messages(
 
 def build_prompt(channel_messages: dict[str, str], date_str: str) -> str:
     """Build the Claude prompt from collected messages."""
-    prompt = f"""You are a helpful assistant that summarizes Discord server activity.
-Below are all the messages from a Discord server on {date_str}, organized by channel.
+    prompt = f"""You summarize daily progress for a Discord server on {date_str}.
 
-Your job:
-1. Write a concise but comprehensive daily summary.
-2. Organize by topic/theme rather than by channel when themes span channels.
-3. Highlight key decisions, action items, blockers, and important links shared.
-4. Mention who said what when attribution matters (e.g., decisions, commitments).
-5. Note any unresolved questions or debates.
-6. Keep it under ~800 words. Use natural prose, not excessive bullet points.
-7. If a channel had only casual/social chat, summarize it in one sentence.
-8. Skip channels with no substantive content.
+Rules:
+- Focus ONLY on progress toward the final product: decisions made, work completed, blockers hit, next steps.
+- Keep it short. Use 1-2 sentence paragraphs max. Use bullet points for lists of items.
+- Skip casual/social chatter entirely.
+- Attribute decisions and commitments to specific people.
+- Do NOT include a "Key Open Questions" or "Unresolved" section.
+- Keep the entire summary under 400 words.
 
 Here are today's messages:
 
@@ -166,7 +163,7 @@ Here are today's messages:
     for ch_name, msgs in channel_messages.items():
         prompt += f"=== #{ch_name} ===\n{msgs}\n\n"
 
-    prompt += "Write the daily summary now."
+    prompt += "Write the daily progress summary now."
     return prompt
 
 
@@ -193,20 +190,19 @@ def find_summary_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     return None
 
 
-async def split_and_send(channel: discord.TextChannel, content: str):
-    """Send a message, splitting if it exceeds Discord's 2000 char limit."""
-    # Add header
-    date_str = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
-    header = f"## 📋 Daily Summary — {date_str}\n\n"
-    full_content = header + content
+async def create_thread(ctx: commands.Context, name: str) -> discord.Thread:
+    """Create a thread on the user's command message."""
+    return await ctx.message.create_thread(name=name[:100])
 
-    if len(full_content) <= 2000:
-        await channel.send(full_content)
+
+async def split_and_send(target: discord.abc.Messageable, content: str):
+    """Send a message, splitting if it exceeds Discord's 2000 char limit."""
+    if len(content) <= 2000:
+        await target.send(content)
         return
 
-    # Split into chunks at paragraph boundaries
     chunks = []
-    current = header
+    current = ""
     for paragraph in content.split("\n\n"):
         if len(current) + len(paragraph) + 2 > 1900:
             chunks.append(current.strip())
@@ -216,9 +212,27 @@ async def split_and_send(channel: discord.TextChannel, content: str):
         chunks.append(current.strip())
 
     for i, chunk in enumerate(chunks):
-        await channel.send(chunk)
+        await target.send(chunk)
         if i < len(chunks) - 1:
             await asyncio.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Project context — reads all past summaries from the summary channel
+# ---------------------------------------------------------------------------
+
+async def fetch_project_context(guild: discord.Guild) -> str:
+    """Read all past bot-posted summaries from the summary channel."""
+    channel = find_summary_channel(guild)
+    if channel is None:
+        return ""
+
+    summaries = []
+    async for msg in channel.history(limit=200, oldest_first=True):
+        if msg.author.id == bot.user.id and msg.content.strip():
+            summaries.append(msg.content)
+
+    return "\n\n---\n\n".join(summaries)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +275,9 @@ async def run_summary(guild: discord.Guild, target_date: Optional[datetime] = No
         )
         return summary
 
-    await split_and_send(target_channel, summary)
+    date_str_header = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+    header = f"## 📋 Daily Summary — {date_str_header}\n\n"
+    await split_and_send(target_channel, header + summary)
     log.info(f"Summary posted to #{target_channel.name}")
     return summary
 
@@ -314,49 +330,130 @@ async def on_ready():
         daily_summary_loop.start()
 
 
-@bot.command(name="now")
-async def summary_now(ctx: commands.Context):
-    """!summarynow — Generate a summary for today immediately."""
-    if not ctx.author.guild_permissions.manage_messages:
-        await ctx.reply("You need Manage Messages permission to trigger a summary.")
-        return
-
-    await ctx.reply("⏳ Generating summary... this may take a minute.")
+@bot.command(name="today")
+async def cmd_today(ctx: commands.Context):
+    """!today — Generate a summary for today immediately."""
+    thread = await create_thread(ctx, f"Today's Summary")
+    await thread.send("⏳ Generating summary... this may take a minute.")
     try:
         summary = await run_summary(ctx.guild)
         if summary is None:
-            await ctx.reply("No messages found today.")
+            await thread.send("No messages found today.")
+        else:
+            await thread.send("✅ Summary posted to #{}".format(SUMMARY_CHANNEL_NAME))
     except Exception as e:
         log.error(f"Manual summary failed: {e}")
-        await ctx.reply(f"❌ Error generating summary: {e}")
+        await thread.send(f"❌ Error generating summary: {e}")
 
 
 @bot.command(name="yesterday")
-async def summary_yesterday(ctx: commands.Context):
-    """!summaryyesterday — Generate a summary for yesterday."""
-    if not ctx.author.guild_permissions.manage_messages:
-        await ctx.reply("You need Manage Messages permission to trigger a summary.")
-        return
-
-    await ctx.reply("⏳ Generating yesterday's summary...")
+async def cmd_yesterday(ctx: commands.Context):
+    """!yesterday — Generate a summary for yesterday."""
+    thread = await create_thread(ctx, f"Yesterday's Summary")
+    await thread.send("⏳ Generating yesterday's summary...")
     try:
         yesterday = datetime.now(timezone.utc) - timedelta(days=1)
         summary = await run_summary(ctx.guild, target_date=yesterday)
         if summary is None:
-            await ctx.reply("No messages found yesterday.")
+            await thread.send("No messages found yesterday.")
+        else:
+            await thread.send("✅ Summary posted to #{}".format(SUMMARY_CHANNEL_NAME))
     except Exception as e:
         log.error(f"Manual summary failed: {e}")
-        await ctx.reply(f"❌ Error generating summary: {e}")
+        await thread.send(f"❌ Error generating summary: {e}")
 
 
-@bot.command(name="summaryhelp")
-async def summary_help(ctx: commands.Context):
-    """!summaryhelp — Show available commands."""
+@bot.command(name="query")
+async def cmd_query(ctx: commands.Context, *, question: str = ""):
+    """!query <question> — Ask a question about the project."""
+    if not question:
+        await ctx.reply("Usage: `!query <your question>`")
+        return
+
+    thread = await create_thread(ctx, question[:100])
+    await thread.send("🤔 Looking through project history...")
+    try:
+        context = await fetch_project_context(ctx.guild)
+        if not context:
+            await thread.send("No past summaries found yet. Run `!today` first to build context.")
+            return
+
+        prompt = f"""You are a knowledgeable assistant for a project team. Below are all the daily progress summaries posted so far. Use them to answer the user's question accurately and concisely.
+
+If the answer isn't covered by the summaries, say so honestly.
+
+=== PROJECT HISTORY ===
+{context}
+=== END HISTORY ===
+
+Question: {question}
+
+Answer concisely."""
+
+        log.info(f"!query: {question}")
+        response = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        answer = response.content[0].text
+        await split_and_send(thread, f"**Q:** {question}\n\n{answer}")
+    except Exception as e:
+        log.error(f"Query command failed: {e}")
+        await thread.send(f"❌ Error: {e}")
+
+
+@bot.command(name="summary")
+async def cmd_summary(ctx: commands.Context):
+    """!summary — Generate a high-level overview of the entire project."""
+    thread = await create_thread(ctx, "Project Overview")
+    await thread.send("📊 Generating project overview...")
+    try:
+        context = await fetch_project_context(ctx.guild)
+        if not context:
+            await thread.send("No past summaries found yet. Run `!today` first to build context.")
+            return
+
+        prompt = f"""You are a project analyst. Below are all the daily progress summaries for a project. Write a high-level project overview that covers:
+
+1. **The problem** the team is trying to solve (1-2 sentences)
+2. **The approach / solution** being built (short paragraph)
+3. **Subteams / workstreams** and who is working on what (bullet points)
+4. **Current status** — what's done, what's in progress (bullet points)
+5. **Key milestones** reached so far (bullet points)
+
+Keep it concise and factual. Use only information from the summaries.
+
+=== ALL DAILY SUMMARIES ===
+{context}
+=== END ===
+
+Write the project overview now."""
+
+        log.info("Generating total project summary...")
+        response = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        overview = response.content[0].text
+        await split_and_send(thread, f"## 📊 Project Overview\n\n{overview}")
+    except Exception as e:
+        log.error(f"Total summary failed: {e}")
+        await thread.send(f"❌ Error: {e}")
+
+
+@bot.command(name="help")
+async def cmd_help(ctx: commands.Context):
+    """!help — Show available commands."""
+    thread = await create_thread(ctx, "Bot Help")
     help_text = """**📋 Summary Bot Commands**
 
-`!summarynow` — Generate today's summary immediately
-`!summaryyesterday` — Generate yesterday's summary
-`!summaryhelp` — Show this message
+`!today` — Generate today's summary
+`!yesterday` — Generate yesterday's summary
+`!query <question>` — Ask a question about the project
+`!summary` — High-level overview of the entire project
+`!help` — Show this message
 
 The bot also posts an automatic summary every day at {hour:02d}:{minute:02d} UTC in #{channel}.
 """.format(
@@ -364,7 +461,7 @@ The bot also posts an automatic summary every day at {hour:02d}:{minute:02d} UTC
         minute=SUMMARY_MINUTE,
         channel=SUMMARY_CHANNEL_NAME,
     )
-    await ctx.reply(help_text)
+    await thread.send(help_text)
 
 
 # ---------------------------------------------------------------------------
