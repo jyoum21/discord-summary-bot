@@ -11,6 +11,8 @@ Usage:
 """
 
 import os
+import re
+import sqlite3
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
@@ -38,6 +40,8 @@ IGNORED_CHANNELS = [
     for c in os.getenv("IGNORED_CHANNELS", "").split(",")
     if c.strip()
 ]
+DB_PATH = os.getenv("DB_PATH", "messages.db")
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "30"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -220,6 +224,233 @@ async def split_and_send(target: discord.abc.Messageable, content: str):
 
 
 # ---------------------------------------------------------------------------
+# Persistent message store (SQLite + FTS5)
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = frozenset({
+    "what", "is", "the", "a", "an", "in", "on", "at", "to", "for", "of",
+    "and", "or", "are", "was", "were", "how", "why", "when", "where", "who",
+    "which", "that", "this", "with", "from", "by", "about", "do", "does",
+    "did", "will", "would", "could", "should", "can", "has", "have", "had",
+    "been", "being", "be", "it", "its", "they", "them", "their", "we", "our",
+    "i", "my", "me", "you", "your", "not", "but", "if", "so", "just",
+    "than", "then", "also", "into", "out", "up", "down",
+})
+
+_backfill_done: set[int] = set()
+
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    """Create tables, FTS5 index, and sync triggers."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            channel_name TEXT NOT NULL,
+            author TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_guild_time
+        ON messages(guild_id, timestamp DESC)
+    """)
+    c.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            channel_name, author, content,
+            content=messages, content_rowid=rowid
+        )
+    """)
+    c.executescript("""
+        CREATE TRIGGER IF NOT EXISTS fts_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, channel_name, author, content)
+            VALUES (new.rowid, new.channel_name, new.author, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS fts_delete AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, channel_name, author, content)
+            VALUES ('delete', old.rowid, old.channel_name, old.author, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS fts_update AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, channel_name, author, content)
+            VALUES ('delete', old.rowid, old.channel_name, old.author, old.content);
+            INSERT INTO messages_fts(rowid, channel_name, author, content)
+            VALUES (new.rowid, new.channel_name, new.author, new.content);
+        END;
+    """)
+
+    msg_count = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    if msg_count > 0:
+        fts_count = c.execute(
+            "SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+        if fts_count == 0:
+            log.info(f"Rebuilding FTS index for {msg_count} messages...")
+            c.execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+
+    conn.commit()
+    conn.close()
+    log.info(f"Message database ready ({DB_PATH})")
+
+
+def store_message(msg_id: str, guild_id: str, channel_name: str,
+                  author: str, content: str, timestamp: str):
+    """Persist a single message (no-op on duplicate)."""
+    conn = _get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+            (msg_id, guild_id, channel_name, author, content, timestamp),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def store_messages_batch(rows: list[tuple]):
+    """Bulk-insert messages (skips duplicates)."""
+    conn = _get_db()
+    try:
+        conn.executemany(
+            "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)", rows
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_fts_query(question: str) -> str:
+    """Convert a natural-language question into an FTS5 OR-query."""
+    cleaned = re.sub(r"[^\w\s]", " ", question)
+    words = [w for w in cleaned.lower().split()
+             if w not in _STOP_WORDS and len(w) > 1]
+    if not words:
+        words = [w for w in cleaned.lower().split() if len(w) > 1][:3]
+    if not words:
+        return ""
+    return " OR ".join(f'"{w}"' for w in words[:10])
+
+
+def search_messages(guild_id: str, question: str,
+                    limit: int = 80) -> list[dict]:
+    """Full-text search for messages relevant to *question*."""
+    fts_q = _build_fts_query(question)
+    if not fts_q:
+        return []
+    conn = _get_db()
+    try:
+        rows = conn.execute("""
+            SELECT m.channel_name, m.author, m.content, m.timestamp
+            FROM messages m
+            JOIN messages_fts ON messages_fts.rowid = m.rowid
+            WHERE messages_fts MATCH ? AND m.guild_id = ?
+            ORDER BY rank
+            LIMIT ?
+        """, (fts_q, guild_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"FTS search failed: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_recent_messages(guild_id: str, days: int = 7,
+                        limit: int = 500) -> list[dict]:
+    """Return the most recent messages from the last *days* days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = _get_db()
+    try:
+        rows = conn.execute("""
+            SELECT channel_name, author, content, timestamp
+            FROM messages
+            WHERE guild_id = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (guild_id, cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"Recent-messages query failed: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _format_db_messages(rows: list[dict], header: str,
+                        max_chars: int = 60000) -> str:
+    """Format DB rows into a readable context block for Claude."""
+    if not rows:
+        return ""
+    by_channel: dict[str, list[str]] = {}
+    for r in rows:
+        ch = r["channel_name"]
+        if ch not in by_channel:
+            by_channel[ch] = []
+        try:
+            ts = datetime.fromisoformat(
+                r["timestamp"]).strftime("%Y-%m-%d %I:%M %p")
+        except (ValueError, TypeError):
+            ts = r["timestamp"]
+        by_channel[ch].append(f"[{ts}] {r['author']}: {r['content']}")
+
+    parts = [f"=== {header} ==="]
+    for ch, msgs in by_channel.items():
+        parts.append(f"\n## #{ch}")
+        parts.extend(msgs)
+    text = "\n".join(parts)
+    return truncate_text(text, max_chars)
+
+
+async def backfill_messages(guild: discord.Guild):
+    """One-time backfill of message history from all readable channels."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
+    total = 0
+    log.info(
+        f"Backfilling up to {BACKFILL_DAYS} days of history "
+        f"for {guild.name}..."
+    )
+
+    for channel in guild.text_channels:
+        if channel.name in IGNORED_CHANNELS:
+            continue
+        batch: list[tuple] = []
+        try:
+            async for msg in channel.history(
+                after=cutoff, limit=None, oldest_first=True
+            ):
+                if msg.author.bot or not msg.content.strip():
+                    continue
+                batch.append((
+                    str(msg.id), str(guild.id), channel.name,
+                    msg.author.display_name, msg.content,
+                    msg.created_at.isoformat(),
+                ))
+                if len(batch) >= 500:
+                    store_messages_batch(batch)
+                    total += len(batch)
+                    batch = []
+            if batch:
+                store_messages_batch(batch)
+                total += len(batch)
+        except discord.Forbidden:
+            log.warning(f"  Backfill: no permission for #{channel.name}")
+        except Exception as e:
+            log.error(f"  Backfill error in #{channel.name}: {e}")
+        await asyncio.sleep(1)
+
+    log.info(f"Backfill complete for {guild.name}: {total} messages stored")
+
+
+# ---------------------------------------------------------------------------
 # Project context — reads all past summaries from the summary channel
 # ---------------------------------------------------------------------------
 
@@ -328,8 +559,25 @@ async def on_ready():
                 f"    ⚠ No #{SUMMARY_CHANNEL_NAME} channel found! "
                 f"Create one or set SUMMARY_CHANNEL in .env"
             )
+        if guild.id not in _backfill_done:
+            _backfill_done.add(guild.id)
+            bot.loop.create_task(backfill_messages(guild))
     if not daily_summary_loop.is_running():
         daily_summary_loop.start()
+
+
+@bot.event
+async def on_message(msg: discord.Message):
+    """Capture every non-bot message into the database in real time."""
+    if not msg.author.bot and msg.guild and msg.content.strip():
+        channel_name = getattr(msg.channel, "name", None)
+        if channel_name and channel_name not in IGNORED_CHANNELS:
+            store_message(
+                str(msg.id), str(msg.guild.id), channel_name,
+                msg.author.display_name, msg.content,
+                msg.created_at.isoformat(),
+            )
+    await bot.process_commands(msg)
 
 
 @bot.command(name="today")
@@ -373,26 +621,51 @@ async def cmd_query(ctx: commands.Context, *, question: str = ""):
         return
 
     thread = await get_or_create_thread(ctx, question[:100])
-    await thread.send("🤔 Looking through project history...")
+    await thread.send("🤔 Searching project history...")
     try:
-        context = await fetch_project_context(ctx.guild)
-        if not context:
-            await thread.send("No past summaries found yet. Run `!today` first to build context.")
+        guild_id = str(ctx.guild.id)
+
+        relevant = search_messages(guild_id, question, limit=80)
+        recent = get_recent_messages(guild_id, days=7, limit=300)
+        summaries = await fetch_project_context(ctx.guild)
+
+        relevant_block = _format_db_messages(
+            relevant, "MESSAGES MATCHING YOUR QUERY")
+        recent_block = _format_db_messages(
+            recent, "RECENT SERVER ACTIVITY (last 7 days)")
+        summary_block = (
+            f"=== DAILY PROGRESS SUMMARIES ===\n{summaries}"
+            if summaries else ""
+        )
+
+        context = "\n\n".join(
+            b for b in [relevant_block, recent_block, summary_block] if b
+        )
+
+        if not context.strip():
+            await thread.send(
+                "No project history found yet. The bot captures messages "
+                "automatically — check back after some activity, or run "
+                "`!today` to generate the first summary."
+            )
             return
 
-        prompt = f"""You are a knowledgeable assistant for a project team. Below are all the daily progress summaries posted so far. Use them to answer the user's question accurately and concisely.
+        prompt = f"""You are a knowledgeable assistant for a project team's Discord server. You have access to three sources of context:
 
-If the answer isn't covered by the summaries, say so honestly.
+1. Messages that matched the user's query (most relevant)
+2. Recent server activity (last 7 days of raw messages)
+3. Daily progress summaries (high-level project history)
 
-=== PROJECT HISTORY ===
+Use ALL available context to answer the question accurately and concisely.
+If the answer isn't fully covered, say what you can determine and note any gaps.
+
 {context}
-=== END HISTORY ===
 
 Question: {question}
 
 Answer concisely."""
 
-        log.info(f"!query: {question}")
+        log.info(f"!query: {question} ({len(prompt)} chars)")
         response = claude.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
@@ -411,12 +684,26 @@ async def cmd_summary(ctx: commands.Context):
     thread = await get_or_create_thread(ctx, "Project Overview")
     await thread.send("📊 Generating project overview...")
     try:
-        context = await fetch_project_context(ctx.guild)
-        if not context:
-            await thread.send("No past summaries found yet. Run `!today` first to build context.")
+        guild_id = str(ctx.guild.id)
+        summaries = await fetch_project_context(ctx.guild)
+        recent = get_recent_messages(guild_id, days=14, limit=500)
+        recent_block = _format_db_messages(
+            recent, "RECENT SERVER ACTIVITY (last 14 days)")
+
+        context = ""
+        if summaries:
+            context += f"=== DAILY PROGRESS SUMMARIES ===\n{summaries}\n\n"
+        if recent_block:
+            context += recent_block
+
+        if not context.strip():
+            await thread.send(
+                "No project history found yet. The bot captures messages "
+                "automatically — check back after some activity."
+            )
             return
 
-        prompt = f"""You are a project analyst. Below are all the daily progress summaries for a project. Write a high-level project overview that covers:
+        prompt = f"""You are a project analyst. Below is the full context from a project team's Discord server, including daily summaries and recent raw messages. Write a high-level project overview that covers:
 
 1. **The problem** the team is trying to solve (1-2 sentences)
 2. **The approach / solution** being built (short paragraph)
@@ -424,11 +711,9 @@ async def cmd_summary(ctx: commands.Context):
 4. **Current status** — what's done, what's in progress (bullet points)
 5. **Key milestones** reached so far (bullet points)
 
-Keep it concise and factual. Use only information from the summaries.
+Keep it concise and factual. Use only information from the provided context.
 
-=== ALL DAILY SUMMARIES ===
 {context}
-=== END ===
 
 Write the project overview now."""
 
@@ -452,11 +737,11 @@ async def cmd_help(ctx: commands.Context):
 
 `!today` — Generate today's summary
 `!yesterday` — Generate yesterday's summary
-`!query <question>` — Ask a question about the project
+`!query <question>` — Ask a question about the project (searches all message history)
 `!summary` — High-level overview of the entire project
 `!help` — Show this message
 
-The bot also posts an automatic summary every day at {hour:02d}:{minute:02d} UTC in #{channel}.
+The bot captures all server messages for context and posts an automatic summary every day at {hour:02d}:{minute:02d} UTC in #{channel}.
 """.format(
         hour=SUMMARY_HOUR,
         minute=SUMMARY_MINUTE,
@@ -477,6 +762,7 @@ def main():
         log.error("ANTHROPIC_API_KEY not set. Check your .env file.")
         return
 
+    init_db()
     log.info("Starting Summary Bot...")
     bot.run(DISCORD_TOKEN, log_handler=None)
 
