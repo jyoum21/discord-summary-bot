@@ -33,7 +33,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 SUMMARY_CHANNEL_NAME = os.getenv("SUMMARY_CHANNEL", "daily-summary")
 SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "23"))  # 24h format, UTC
 SUMMARY_MINUTE = int(os.getenv("SUMMARY_MINUTE", "55"))
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-5-20251101")
 MAX_TOKENS_PER_CHANNEL = int(os.getenv("MAX_TOKENS_PER_CHANNEL", "8000"))
 IGNORED_CHANNELS = [
     c.strip()
@@ -42,6 +42,7 @@ IGNORED_CHANNELS = [
 ]
 DB_PATH = os.getenv("DB_PATH", "messages.db")
 BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "30"))
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,6 +67,15 @@ claude = Anthropic(api_key=ANTHROPIC_API_KEY)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _extract_text(response) -> str:
+    """Extract text from a Claude response that may contain tool-use blocks."""
+    parts = []
+    for block in response.content:
+        if hasattr(block, "text"):
+            parts.append(block.text)
+    return "\n\n".join(parts) if parts else ""
+
 
 def truncate_text(text: str, max_chars: int) -> str:
     """Truncate text to roughly max_chars, preserving complete messages."""
@@ -116,7 +126,14 @@ async def fetch_channel_messages(
                     reply_prefix = f"(replying to {ref.author.display_name}) "
 
             if content.strip():
-                messages.append(f"[{timestamp}] {author}: {reply_prefix}{content}")
+                msg_link = (
+                    f"https://discord.com/channels/"
+                    f"{msg.guild.id}/{msg.channel.id}/{msg.id}"
+                )
+                messages.append(
+                    f"[{timestamp}] {author}: {reply_prefix}{content} "
+                    f"(<{msg_link}>)"
+                )
 
     except discord.Forbidden:
         log.warning(f"No permission to read #{channel.name}")
@@ -158,6 +175,7 @@ Rules:
 - Keep it short. Use 1-2 sentence paragraphs max. Use bullet points for lists of items.
 - Skip casual/social chatter entirely.
 - Attribute decisions and commitments to specific people.
+- When referencing a specific message or conversation, always include its hyperlink (provided in the context as <https://discord.com/channels/...>).
 - Do NOT include a "Key Open Questions" or "Unresolved" section.
 - Keep the entire summary under 400 words.
 
@@ -180,10 +198,11 @@ def generate_summary(channel_messages: dict[str, str], date_str: str) -> str:
     response = claude.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=2048,
+        tools=[WEB_SEARCH_TOOL],
         messages=[{"role": "user", "content": prompt}],
     )
 
-    return response.content[0].text
+    return _extract_text(response)
 
 
 def find_summary_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
@@ -255,12 +274,18 @@ def init_db():
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
             guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL DEFAULT '',
             channel_name TEXT NOT NULL,
             author TEXT NOT NULL,
             content TEXT NOT NULL,
             timestamp TEXT NOT NULL
         )
     """)
+    try:
+        c.execute("ALTER TABLE messages ADD COLUMN channel_id TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_messages_guild_time
         ON messages(guild_id, timestamp DESC)
@@ -302,14 +327,17 @@ def init_db():
     log.info(f"Message database ready ({DB_PATH})")
 
 
-def store_message(msg_id: str, guild_id: str, channel_name: str,
-                  author: str, content: str, timestamp: str):
+def store_message(msg_id: str, guild_id: str, channel_id: str,
+                  channel_name: str, author: str, content: str,
+                  timestamp: str):
     """Persist a single message (no-op on duplicate)."""
     conn = _get_db()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)",
-            (msg_id, guild_id, channel_name, author, content, timestamp),
+            "INSERT OR IGNORE INTO messages "
+            "(id, guild_id, channel_id, channel_name, author, content, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (msg_id, guild_id, channel_id, channel_name, author, content, timestamp),
         )
         conn.commit()
     finally:
@@ -321,7 +349,9 @@ def store_messages_batch(rows: list[tuple]):
     conn = _get_db()
     try:
         conn.executemany(
-            "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)", rows
+            "INSERT OR IGNORE INTO messages "
+            "(id, guild_id, channel_id, channel_name, author, content, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", rows
         )
         conn.commit()
     finally:
@@ -349,7 +379,8 @@ def search_messages(guild_id: str, question: str,
     conn = _get_db()
     try:
         rows = conn.execute("""
-            SELECT m.channel_name, m.author, m.content, m.timestamp
+            SELECT m.id, m.guild_id, m.channel_id,
+                   m.channel_name, m.author, m.content, m.timestamp
             FROM messages m
             JOIN messages_fts ON messages_fts.rowid = m.rowid
             WHERE messages_fts MATCH ? AND m.guild_id = ?
@@ -371,7 +402,8 @@ def get_recent_messages(guild_id: str, days: int = 7,
     conn = _get_db()
     try:
         rows = conn.execute("""
-            SELECT channel_name, author, content, timestamp
+            SELECT id, guild_id, channel_id,
+                   channel_name, author, content, timestamp
             FROM messages
             WHERE guild_id = ? AND timestamp >= ?
             ORDER BY timestamp DESC
@@ -400,7 +432,15 @@ def _format_db_messages(rows: list[dict], header: str,
                 r["timestamp"]).strftime("%Y-%m-%d %I:%M %p")
         except (ValueError, TypeError):
             ts = r["timestamp"]
-        by_channel[ch].append(f"[{ts}] {r['author']}: {r['content']}")
+        msg_link = ""
+        if r.get("channel_id") and r.get("id") and r.get("guild_id"):
+            msg_link = (
+                f" (<https://discord.com/channels/"
+                f"{r['guild_id']}/{r['channel_id']}/{r['id']}>)"
+            )
+        by_channel[ch].append(
+            f"[{ts}] {r['author']}: {r['content']}{msg_link}"
+        )
 
     parts = [f"=== {header} ==="]
     for ch, msgs in by_channel.items():
@@ -430,9 +470,9 @@ async def backfill_messages(guild: discord.Guild):
                 if msg.author.bot or not msg.content.strip():
                     continue
                 batch.append((
-                    str(msg.id), str(guild.id), channel.name,
-                    msg.author.display_name, msg.content,
-                    msg.created_at.isoformat(),
+                    str(msg.id), str(guild.id), str(channel.id),
+                    channel.name, msg.author.display_name,
+                    msg.content, msg.created_at.isoformat(),
                 ))
                 if len(batch) >= 500:
                     store_messages_batch(batch)
@@ -573,7 +613,8 @@ async def on_message(msg: discord.Message):
         channel_name = getattr(msg.channel, "name", None)
         if channel_name and channel_name not in IGNORED_CHANNELS:
             store_message(
-                str(msg.id), str(msg.guild.id), channel_name,
+                str(msg.id), str(msg.guild.id),
+                str(msg.channel.id), channel_name,
                 msg.author.display_name, msg.content,
                 msg.created_at.isoformat(),
             )
@@ -658,6 +699,7 @@ async def cmd_query(ctx: commands.Context, *, question: str = ""):
 
 Use ALL available context to answer the question accurately and concisely.
 If the answer isn't fully covered, say what you can determine and note any gaps.
+When referencing specific messages, always include the message hyperlink (provided in the context as <https://discord.com/channels/...>).
 
 {context}
 
@@ -669,9 +711,10 @@ Answer concisely."""
         response = claude.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
+            tools=[WEB_SEARCH_TOOL],
             messages=[{"role": "user", "content": prompt}],
         )
-        answer = response.content[0].text
+        answer = _extract_text(response)
         await split_and_send(thread, f"**Q:** {question}\n\n{answer}")
     except Exception as e:
         log.error(f"Query command failed: {e}")
@@ -712,6 +755,7 @@ async def cmd_summary(ctx: commands.Context):
 5. **Key milestones** reached so far (bullet points)
 
 Keep it concise and factual. Use only information from the provided context.
+When referencing specific messages or conversations, always include the message hyperlink (provided in the context as <https://discord.com/channels/...>).
 
 {context}
 
@@ -721,9 +765,10 @@ Write the project overview now."""
         response = claude.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=2048,
+            tools=[WEB_SEARCH_TOOL],
             messages=[{"role": "user", "content": prompt}],
         )
-        overview = response.content[0].text
+        overview = _extract_text(response)
         await split_and_send(thread, f"## 📊 Project Overview\n\n{overview}")
     except Exception as e:
         log.error(f"Total summary failed: {e}")
